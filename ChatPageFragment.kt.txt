@@ -1,0 +1,1014 @@
+package com.facebooklogin.application.fragments
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.*
+import android.text.Editable
+import android.text.TextWatcher
+import android.util.Log
+import android.view.View
+import android.widget.MediaController
+import android.widget.Toast
+import androidx.activity.viewModels
+import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContentProviderCompat.requireContext
+import androidx.core.view.isVisible
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.navArgs
+import androidx.paging.PagingData
+import androidx.paging.map
+import com.bumptech.glide.Glide
+import com.bumptech.glide.load.DecodeFormat
+import com.bumptech.glide.request.RequestOptions
+import com.facebooklogin.application.R
+import com.facebooklogin.application.adapters.AllMessagePagingAdapter
+import com.facebooklogin.application.adapters.MessageAdapter
+import com.facebooklogin.application.kotlin.Letstry
+import com.facebooklogin.application.listener.OnMessageClick
+import com.facebooklogin.application.modal.MessageModel
+import com.facebooklogin.application.modal.NotificationData
+import com.facebooklogin.application.modal.PushNotification
+import com.facebooklogin.application.modal.responses.AllmessageItem
+import com.facebooklogin.application.modal.responses.AllmessageItems
+import com.facebooklogin.application.modal.responses.UpdateStatus
+import com.facebooklogin.application.utils.*
+import com.facebooklogin.application.utils.Constants.Companion.API_KEY
+import com.facebooklogin.application.utils.Constants.Companion.CHAT_SOCKET_URL
+import com.facebooklogin.application.viewmodels.ChatViewModel
+import com.facebooklogin.application.viewmodels.NotificationViewModel
+import com.facebooklogin.application.widgets.UpdateStatusApi
+import com.github.nkzawa.emitter.Emitter
+import com.github.nkzawa.socketio.client.IO
+import com.github.nkzawa.socketio.client.Socket
+import com.google.firebase.auth.FirebaseAuth
+import com.google.gson.JsonObject
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.android.synthetic.main.fragment_chatpage.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.RequestBody
+import okhttp3.internal.notifyAll
+import org.json.JSONObject
+import retrofit2.Call
+import retrofit2.Callback
+import retrofit2.Response
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.URISyntaxException
+import java.text.SimpleDateFormat
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.*
+import javax.annotation.meta.When
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class ChatPageFragment : AppCompatActivity(), UploadRequestBody.UploadCallback, TextWatcher,OnMessageClick {
+    companion object {
+        const val REQUEST_CODE_PICK_IMAGE = 101
+        const val REQUEST_CODE_PICK_VIDEO = 102
+    }
+    var name:String?=null
+    var userId:String?=null
+    var conversationId:String?=null
+    var image:String?=null
+    val chatviewmodel:ChatViewModel by viewModels()
+    val notificationViewModel:NotificationViewModel by viewModels()
+    var currentUser:String?=null
+    var currentUserName:String?=null
+    private var socket: Socket? = null
+    //var adapter: MessageAdapter? = null
+    var notification_token:String?=null
+
+    var status:Boolean = false
+
+    //paging adapter
+     lateinit var adapter:AllMessagePagingAdapter
+
+
+
+
+    private var messagelist: List<AllmessageItems>? = null
+    @RequiresApi(Build.VERSION_CODES.O)
+    @SuppressLint("NotifyDataSetChanged")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.fragment_chatpage)
+
+        name = intent.extras!!.getString("name")
+        userId = intent.extras!!.getString("userid")
+        image = intent.extras!!.getString("image")
+        notification_token= intent.extras!!.getString("notificationToken")
+
+        conversationId=intent.extras!!.getString("conversationId")
+        currentUser=getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 0).toString()
+        currentUserName = getSharedPreferences("userpref", Context.MODE_PRIVATE).getString("username","")
+        //setting user data
+        tv_chat_name.text = name
+        Glide.with(this).load("https://bitsphere.in/Brig/profile/"+image).into(iv_chat_image)
+         getmessage()
+        //getting messaged by paging
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            userStaus()
+        }
+        adapter = AllMessagePagingAdapter(this,this)
+        getMessagesByPaging()
+
+
+
+       // subscribeToGetMessage(conversationId!!)
+        InitSockets()
+
+        val controller = MediaController(this)
+        controller.setMediaPlayer(videoview)
+        videoview.setMediaController(controller)
+
+
+       iv_back_from_chat.setOnClickListener {
+           finish()
+       }
+
+        iv_video_pick.setOnClickListener {
+            videoview.isVisible=true
+            tapabove.isVisible=true
+            btn_send_video.isVisible=true
+            relativeLayout2.isVisible=false
+        }
+
+        videoview.setOnClickListener {
+            pickVideo()
+        }
+
+        btn_send_video.setOnClickListener {
+            uploadVideo()
+        }
+
+
+
+        tv_message_send.setOnClickListener {
+
+            val message= et_chat_message.text.toString().trim()
+            if(message.isEmpty()){
+                Toast.makeText(this, "please type something before send", Toast.LENGTH_SHORT).show()
+            }else{
+                sendMessageThrougSocketIo(
+                    message,
+                    currentUser!!,
+                    userId!!
+                )
+                // sending notification
+                Log.d("nnn",notification_token!!)
+                val n_data= NotificationData("$currentUserName sends you a message",message)
+                val notification = PushNotification(n_data,notification_token!!)
+                notificationViewModel.postNotification(notification)
+                subscribeToNotification()
+                val newMessage = AllmessageItem(
+                        text = message,
+                        sender = currentUser!!,
+                        conversationId = conversationId!!,
+                        updatedAt = System.currentTimeMillis().toString(),
+                        messageType = "text",
+                        isSeen = false,
+                    )
+                    subscribeToSendMessages(newMessage,message)
+
+
+
+            }
+
+        }
+
+        iv_image_pick.setOnClickListener {
+
+            relativeLayout2.isVisible=false
+            relative3.isVisible=true
+        }
+
+        iv_message_chat_picture.setOnClickListener {
+            openImageChooser()
+        }
+
+        send_image.setOnClickListener {
+            uploadImage()
+        }
+        et_chat_message.addTextChangedListener(this)
+    }
+
+    private fun getmessage() {
+        chatviewmodel.getMessage(conversationId!!, API_KEY)
+        lifecycleScope.launchWhenStarted {
+          chatviewmodel.getmessage.collect {
+              when(it){
+                  is AllMessageState.Loading->{
+
+                  }
+                  is AllMessageState.Failure->{
+
+                  }
+                  is AllMessageState.Success->{
+
+                      Log.d("kkjj",it.responce.body()!!.allmessage!!.toString())
+                      if(!it.responce.body()!!.allmessage!!.isEmpty()){
+                          subscribeToUpdateIsSeenonStart(it.responce.body()!!.allmessage!!)
+                      }
+
+
+                  }
+              }
+          }
+        }
+    }
+
+    private fun uploadVideo() {
+
+            if (videouri == null) {
+                // root_updatepic.snackbar("Select an Image First")
+                return
+            }
+
+            val parcelFileDescriptor = contentResolver.openFileDescriptor(videouri!!, "r", null) ?: return
+
+            val inputStream = FileInputStream(parcelFileDescriptor.fileDescriptor)
+            val file = File(cacheDir, contentResolver.getFileName(videouri!!))
+            val outputStream = FileOutputStream(file)
+            inputStream.copyTo(outputStream)
+
+
+
+        Toast.makeText(this, file.toString(), Toast.LENGTH_SHORT).show()
+
+            //pb_updatepic.progress = 0
+            val body = UploadRequestBody(file, "video", this)
+            val conversationIds = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),conversationId!!)
+            val text = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),"")
+            val image = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),"")
+            val sender = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),currentUser!!)
+            val messageType = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),"video")
+            val apikey = RequestBody.create("multipart/form-data".toMediaTypeOrNull(), API_KEY)
+            val video = MultipartBody.Part.createFormData(
+                "video",
+                file.name,
+                body
+            )
+           if(body.contentLength()>9000000){
+               Toast.makeText(this, "file too big", Toast.LENGTH_SHORT).show()
+               videoview.isVisible=false
+               tapabove.isVisible=false
+               loading_sending_video.isVisible=false
+               btn_send_video.isVisible=false
+               relativeLayout2.isVisible=true
+           }else{
+               Log.d("mmm","conver id"+conversationId)
+               chatviewmodel.sendVideoMessage(id= conversationIds,text = text,sender= sender,messageType= messageType,image=image,apikey = apikey,video = video)
+               lifecycleScope.launchWhenStarted {
+                   chatviewmodel.sendvideomessage.collect {
+                       when(it){
+
+                           is sendMessageStateImage.Loading->{
+
+                               Toast.makeText(this@ChatPageFragment, "loading saving video message", Toast.LENGTH_SHORT).show()
+                               loading_sending_video.isVisible=true
+                           }
+                           is sendMessageStateImage.Failure->{
+                               loading_sending_video.isVisible=false
+                               videoview.isVisible=false
+                               tapabove.isVisible=false
+                               btn_send_video.isVisible=false
+                               relativeLayout2.isVisible=true
+                               Log.d("mmm",it.mssg.toString())
+                           }
+                           is sendMessageStateImage.Success->{
+                               Toast.makeText(this@ChatPageFragment, it.responce.body()!!.message , Toast.LENGTH_SHORT).show()
+                               Log.d("mmm",it.responce.body()!!.message)
+                               if(it.responce.body()!!.message == "file too big"){
+                                   Toast.makeText(this@ChatPageFragment, "file too big", Toast.LENGTH_SHORT).show()
+                                   videoview.isVisible=false
+                                   tapabove.isVisible=false
+                                   loading_sending_video.isVisible=false
+                                   btn_send_video.isVisible=false
+                                   relativeLayout2.isVisible=true
+                               }else{
+
+                                   sendImageThrougSocketIos(it.responce.body()!!.image,currentUser!!,userId!!)
+                                   videoview.isVisible=false
+                                   tapabove.isVisible=false
+                                   loading_sending_video.isVisible=false
+                                   btn_send_video.isVisible=false
+                                   relativeLayout2.isVisible=true
+
+
+                                      getMessagesByPaging()
+                                      Handler(Looper.myLooper()).postDelayed({
+                                          getMessagesByPaging()
+                                          subscribeToUpdateIsSeen(adapter.snapshot().items)
+                                          Log.d("ooo",adapter.snapshot().items.toString())
+                                      },1000L)
+
+
+
+                                   //sending notification
+                                   val n_data= NotificationData("$currentUserName sends you a video","video")
+                                   val notification = PushNotification(n_data,notification_token!!)
+                                   notificationViewModel.postNotification(notification)
+                                   subscribeToNotification()
+
+                                   Log.d("mmm",it.responce.body()!!.image)
+                                   Toast.makeText(this@ChatPageFragment, "video sent", Toast.LENGTH_SHORT).show()
+                               }
+
+
+                           }
+                       }
+                   }
+               }
+           }
+
+
+
+
+
+
+    }
+
+
+    private fun pickVideo() {
+        Intent(Intent.ACTION_GET_CONTENT).also {
+            it.type = "video/*"
+            startActivityForResult(it, REQUEST_CODE_PICK_VIDEO)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun userStaus() {
+        chatviewmodel.getsingleuser(API_KEY,userId!!)
+        lifecycleScope.launchWhenStarted {
+            chatviewmodel.getuser.collect {
+                when(it){
+                    is SingleUserState.Loading->{
+                        Toast.makeText(this@ChatPageFragment, "loading status", Toast.LENGTH_SHORT).show()
+                    }
+                    is SingleUserState.Failure->{
+                        Toast.makeText(this@ChatPageFragment, it.mssg.toString(), Toast.LENGTH_SHORT).show()
+                        Log.d("mnmn",it.mssg.toString())
+                    }
+                    is SingleUserState.Success->{
+                        Toast.makeText(this@ChatPageFragment, "aa gya status", Toast.LENGTH_SHORT).show()
+                        val status = it.responce.body()!!.users!![0].status
+                        val lastseen = it.responce.body()!!.users!![0].date.toString()
+                        if(status=="online"){
+                            tv_user_status.text="online"
+                            iv_status.isVisible=true
+                        }else{
+
+                            val formatter: DateTimeFormatter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                DateTimeFormatter.ofPattern(
+                                    "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+                                    Locale.ENGLISH
+                                )
+                            } else {
+                                TODO("VERSION.SDK_INT < O")
+                            }
+                            val localDate: LocalDate =
+                                LocalDate.parse(lastseen, formatter)
+                            val date: Date = Date.from(
+                                localDate.atStartOfDay(ZoneId.systemDefault()).toInstant()
+                            )
+                            val utc = TimeZone.getTimeZone("UTC")
+                            val sourceFormat = SimpleDateFormat("EEE MMM dd HH:mm:ss zzz yyyy")
+                            val destFormat = SimpleDateFormat("dd-MMM-YYYY HH:mm aa")
+                            sourceFormat.timeZone = utc
+                            val convertedDate = sourceFormat.parse(date.toString())
+                            val s = destFormat.format(convertedDate)
+                            Log.d("kjkj",s.toString())
+                            tv_user_status.text="last seen "+date.toString()
+                            iv_status.isVisible=false
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    private fun getMessagesByPaging() {
+        lifecycleScope.launchWhenStarted {
+            chatviewmodel.getAllMessageByPaging(conversationId!!, "bWFnZ2llOnN1bW1lcnM").collect {
+                rv_chat.adapter = adapter
+                rv_chat.smoothScrollToPosition(0)
+                adapter.submitData(it)
+
+            }
+        }
+
+    }
+
+
+
+    @SuppressLint("NotifyDataSetChanged")
+    private fun InitSockets() {
+        try {
+            socket = IO.socket(CHAT_SOCKET_URL)
+            socket!!.connect()
+
+            Log.d("aaa", socket!!.connected().toString())
+            socket!!.emit("signin", currentUser)
+
+            //lsitening for text message
+            socket!!.on("message", Emitter.Listener {
+
+                val recivedMessage = it[0].toString()
+                val decodedData = JSONObject(recivedMessage)
+
+                val message: String = decodedData.getString("message")
+                val sourceId: String = decodedData.getString("sourceId")
+                val targetId: String = decodedData.getString("targetId")
+                val model = AllmessageItem(
+                    sender = sourceId,
+                    text = message,
+                    conversationId = conversationId!!,
+                    updatedAt = System.currentTimeMillis().toString(),
+                    messageType = "text",
+                    isSeen = false
+                )
+
+                runOnUiThread(Runnable {
+
+                   if(sourceId!= currentUser){
+                       Handler(Looper.myLooper()).postDelayed({
+                           getMessagesByPaging()
+                       },500L)
+
+                   }
+                    Handler(Looper.myLooper()).postDelayed({
+                        getMessagesByPaging()
+                        subscribeToUpdateIsSeen(adapter.snapshot().items)
+                        },1000L)
+                        Log.d("ooo",adapter.snapshot().items.toString())
+
+
+                    //}
+
+
+                    // adapter!!.addMessage(model)
+                    //adapter!!.notifyDataSetChanged()
+                    //rv_chat.scrollToPosition(messagelist!!.size - 1)
+                })
+
+            })
+            //listening for typing status
+            socket!!.on("typing", Emitter.Listener {
+                val status = it[0].toString()
+                val decodeStatus = JSONObject(status)
+                val message = decodeStatus.getString("type")
+
+                runOnUiThread(Runnable {
+                    tv_chat_name.text = message
+                })
+            })
+
+            //listening for image
+            socket!!.on("image", Emitter.Listener {
+                val responce = it[0].toString()
+                val decodeImage = JSONObject(responce)
+                val image = decodeImage.getString("image")
+                val sourceId = decodeImage.getString("sourceId")
+
+                if(sourceId !== currentUser){
+                    runOnUiThread(Runnable {
+                        val model = AllmessageItem(
+                            sender = sourceId,
+                            text = "",
+                            conversationId = conversationId!!,
+                            updatedAt = System.currentTimeMillis().toString(),
+                            messageType = "image",
+                            image = image,
+                            isSeen = false
+                        )
+
+                        Handler(Looper.myLooper()).postDelayed(
+                            Runnable {
+                                getMessagesByPaging()
+                            },500L
+                        )
+
+                        Handler(Looper.myLooper()).postDelayed({
+                            getMessagesByPaging()
+                            subscribeToUpdateIsSeen(adapter.snapshot().items)
+                            Log.d("ooo",adapter.snapshot().items.toString())
+                        },1000L)
+                        val models = AllmessageItems(
+                            sender = sourceId,
+                            text = "",
+                            conversationId = conversationId!!,
+                            updatedAt = System.currentTimeMillis().toString(),
+                            messageType = "image",
+                            image = image,
+                            isSeen = false
+                        )
+                       // adapter!!.addMessage(model)
+                        //rv_chat.scrollToPosition(messagelist!!.size-1)
+                        //adapter!!.notifyDataSetChanged()
+                        // subscribeToGetMessage(conversationId!!)
+                    })
+                }
+
+
+
+            })
+
+            //listening for name
+            socket!!.on("setname", Emitter.Listener {
+                val names = it[0].toString()
+                val decodename = JSONObject(names)
+                val username = decodename.getString("name")
+
+                runOnUiThread(Runnable {
+                    tv_chat_name.text = name
+                })
+            })
+
+
+        } catch (e: URISyntaxException) {
+
+        }
+    }
+
+    private fun openImageChooser() {
+        Intent(Intent.ACTION_PICK).also {
+            it.type = "image/*"
+            val mimeTypes = arrayOf("image/jpeg", "image/png")
+            it.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
+            startActivityForResult(it, REQUEST_CODE_PICK_IMAGE)
+        }
+    }
+
+    @SuppressLint("NotifyDataSetChanged")
+    private fun subscribeToSendMessages(message:AllmessageItem,usermessage:String) {
+      //val messageModel = MessageModel(message)
+      chatviewmodel.sendMessage(message, API_KEY)
+        lifecycleScope.launchWhenStarted {
+            chatviewmodel.sendmessage.collect {
+                when (it) {
+                    is sendMessageState.Loading -> {
+                        Toast.makeText(this@ChatPageFragment, "loading", Toast.LENGTH_SHORT).show()
+                    }
+                    is sendMessageState.Failure -> {
+                        Toast.makeText(this@ChatPageFragment, it.mssg.toString(), Toast.LENGTH_SHORT)
+                            .show()
+                        Log.d("kkk", it.mssg.toString())
+                    }
+                    is sendMessageState.Success -> {
+                        et_chat_message.setText("")
+                        Toast.makeText(
+                            this@ChatPageFragment,
+                            it.responce.body()!!.message,
+                            Toast.LENGTH_SHORT
+                        ).show()
+
+                        // adapter!!.notifyDataSetChanged()
+                        // rv_chat.scrollToPosition(messagelist!!.size - 1)
+
+
+                        // by paging
+                        if(message.sender.equals(currentUser!!)){
+                            getMessagesByPaging()
+
+                            Handler(Looper.myLooper()).postDelayed({
+                                getMessagesByPaging()
+                                subscribeToUpdateIsSeen(adapter.snapshot().items)
+                                Log.d("ooo",adapter.snapshot().items.toString())
+                                Log.d("first",adapter.snapshot().items[0].toString())
+
+                            },1000L)
+                        }
+
+
+
+
+
+
+                    }
+                }
+
+            }
+        }
+    }
+    @SuppressLint("NotifyDataSetChanged")
+    private fun subscribeToGetMessage(conversationId: String) {
+        chatviewmodel.getMessage(conversationId, API_KEY)
+
+        lifecycleScope.launchWhenStarted {
+            chatviewmodel.getmessage.collect {
+                when (it) {
+                    is AllMessageState.Loading -> {
+                        Toast.makeText(this@ChatPageFragment, "loading messages", Toast.LENGTH_SHORT)
+                            .show()
+                    }
+                    is AllMessageState.Failure -> {
+                        Toast.makeText(this@ChatPageFragment, it.mssg.toString(), Toast.LENGTH_SHORT)
+                            .show()
+                        Log.d("kkk", it.mssg.toString())
+                    }
+                    is AllMessageState.Success -> {
+                        //messagelist = it.responce.body()!!.allmessage
+                        Log.d("mssg",messagelist.toString())
+
+                        Toast.makeText(this@ChatPageFragment, "message fetched", Toast.LENGTH_SHORT)
+                            .show()
+                        //adapter = MessageAdapter(this@ChatPageFragment, messagelist!!)
+                       // rv_chat.adapter = adapter
+                        //adapter!!.notifyDataSetChanged()
+                       // rv_chat.scrollToPosition(messagelist!!.size - 1)
+
+
+                    }
+                }
+            }
+        }
+
+    }
+
+
+    private  var imageuri: Uri?= null
+    private var videouri:Uri?=null
+    @SuppressLint("NotifyDataSetChanged")
+    private fun uploadImage() {
+        if (imageuri == null) {
+            // root_updatepic.snackbar("Select an Image First")
+            return
+        }
+
+        val parcelFileDescriptor = contentResolver.openFileDescriptor(imageuri!!, "r", null) ?: return
+
+        val inputStream = FileInputStream(parcelFileDescriptor.fileDescriptor)
+        val file = File(cacheDir, contentResolver.getFileName(imageuri!!))
+        val outputStream = FileOutputStream(file)
+        inputStream.copyTo(outputStream)
+
+        //pb_updatepic.progress = 0
+        val body = UploadRequestBody(file, "image", this)
+        val conversationIds = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),conversationId!!)
+        val text = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),"")
+        val sender = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),currentUser!!)
+        val senders = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),currentUser!!).toString()
+        val messageType = RequestBody.create("multipart/form-data".toMediaTypeOrNull(),"image")
+        val apikey = RequestBody.create("multipart/form-data".toMediaTypeOrNull(), API_KEY)
+        val image = MultipartBody.Part.createFormData(
+            "image",
+            file.name,
+            body
+        )
+
+        if(body.contentLength()>8000000){
+            Toast.makeText(this, "file too big", Toast.LENGTH_SHORT).show()
+            iv_message_chat_picture.setImageResource(R.drawable.ic_baseline_image_24)
+            relativeLayout2.isVisible=true
+            relative3.isVisible=false
+            loading_sending_image.isVisible=false
+        }else{
+            Log.d("mmm","conver id"+conversationId)
+            chatviewmodel.sendImageMessage(id= conversationIds,text = text,sender= sender,messageType= messageType,image=image,apikey = apikey)
+            lifecycleScope.launchWhenStarted {
+                chatviewmodel.sendimagemessage.collect {
+                    when(it){
+
+                        is sendMessageStateImage.Loading->{
+
+                            Toast.makeText(this@ChatPageFragment, "loading saving image message", Toast.LENGTH_SHORT).show()
+                            loading_sending_image.isVisible=true
+                        }
+                        is sendMessageStateImage.Failure->{
+
+                            Log.d("mmm",it.mssg.toString())
+                            loading_sending_image.isVisible=false
+                            iv_message_chat_picture.setImageResource(R.drawable.ic_baseline_image_24)
+                            relativeLayout2.isVisible=true
+                            relative3.isVisible=false
+                        }
+                        is sendMessageStateImage.Success->{
+
+                            if(it.responce.body()!!.message.equals("file too big")){
+                                Toast.makeText(this@ChatPageFragment, "file too big", Toast.LENGTH_SHORT).show()
+                            }else{
+                                sendImageThrougSocketIos(it.responce.body()!!.image,currentUser!!,userId!!)
+                                iv_message_chat_picture.setImageResource(R.drawable.ic_baseline_image_24)
+                                relativeLayout2.isVisible=true
+                                relative3.isVisible=false
+                                loading_sending_image.isVisible=false
+                              //  if(senders.equals(getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 0).toString())){
+                                    getMessagesByPaging()
+                                Toast.makeText(this@ChatPageFragment, "image", Toast.LENGTH_SHORT).show()
+                                    Handler(Looper.myLooper()).postDelayed({
+                                        getMessagesByPaging()
+                                        subscribeToUpdateIsSeen(adapter.snapshot().items)
+                                        Log.d("ooo",adapter.snapshot().items.toString())
+                                    },1000L)
+                              //  }
+
+
+
+                                //sending notification
+                                val n_data= NotificationData("$currentUserName sends you a photo","photo")
+                                val notification = PushNotification(n_data,notification_token!!)
+                                notificationViewModel.postNotification(notification)
+                                subscribeToNotification()
+
+                                val newMessage = AllmessageItem(
+                                    text = "",
+                                    sender = currentUser!!,
+                                    conversationId = conversationId!!,
+                                    updatedAt = System.currentTimeMillis().toString(),
+                                    messageType = "image",
+                                    image = it.responce.body()!!.image,
+                                    isSeen = false
+                                )
+
+
+                                //adapter!!.addMessage(newMessage)
+                                //sending image through socket
+                                // sendImageThrougSocketIo(it.responce.body()!!.image,FirebaseAuth.getInstance().currentUser!!.uid,userId!!)
+                                Log.d("mmm",it.responce.body()!!.image)
+                                Toast.makeText(this@ChatPageFragment, "image sent", Toast.LENGTH_SHORT).show()
+
+                                //  val newlist = messagelist as ArrayList
+                                // newlist.add(newMessage)
+                                // subscribeToGetMessage(conversationId!!)
+                                // adapter!!.notifyDataSetChanged()
+                                // rv_chat.scrollToPosition(messagelist!!.size-1)
+
+                            }
+
+
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+
+    }
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode == Activity.RESULT_OK) {
+            when (requestCode) {
+                REQUEST_CODE_PICK_IMAGE -> {
+                    imageuri = data?.data
+                    iv_message_chat_picture.setImageURI(imageuri)
+
+                }
+
+                REQUEST_CODE_PICK_VIDEO->{
+                    videouri = data?.data
+                    videoview.setVideoURI(videouri)
+                    videoview.start()
+                }
+            }
+        }
+    }
+
+
+
+    override fun onProgressUpdate(percentage: Int) {
+
+    }
+
+    override fun beforeTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {
+
+    }
+
+    override fun onTextChanged(p0: CharSequence?, p1: Int, p2: Int, p3: Int) {
+        val typing = JSONObject()
+        typing.put("type", "typing...")
+        typing.put("sender", currentUser)
+        typing.put("target", userId)
+        socket!!.emit("typing", typing)
+    }
+
+    override fun afterTextChanged(p0: Editable?) {
+        val setname = JSONObject()
+        setname.put("name", name!!)
+        setname.put("sender", currentUser)
+        setname.put("target", userId)
+        socket!!.emit("setname", setname)
+    }
+
+    fun sendMessageThrougSocketIo(message: String, sourceId: String, targetId: String) {
+
+        try {
+            val jsonObject = JSONObject()
+            jsonObject.put("message", message)
+            jsonObject.put("sourceId", sourceId)
+            jsonObject.put("targetId", targetId)
+            socket!!.emit("message", jsonObject)
+
+        } catch (e: URISyntaxException) {
+
+        }
+    }
+
+    fun sendImageThrougSocketIos(image: String, sourceId: String, targetId: String) {
+
+        try {
+            val jsonObject = JSONObject()
+            jsonObject.put("image", image)
+            jsonObject.put("sourceId", sourceId)
+            jsonObject.put("targetId", targetId)
+            socket!!.emit("image", jsonObject)
+
+        } catch (e: URISyntaxException) {
+
+        }
+    }
+
+    private fun subscribeToNotification() {
+        lifecycleScope.launchWhenStarted {
+           notificationViewModel.notificationstate.collect {
+                when(it){
+                    is NotificationApiState.Loading->{
+                        Toast.makeText(this@ChatPageFragment, "notification sending", Toast.LENGTH_SHORT).show()
+                    }
+                    is NotificationApiState.Failure->{
+                        //root_listofadmin.snackbar(it.mssg.toString())
+                        Log.d("nnn",it.mssg.toString())
+
+                    }
+                    is NotificationApiState.Success->{
+                        Log.d("nnn",it.responce.errorBody().toString())
+                        //root_listofadmin.snackbar("notification sent")
+                        Toast.makeText(this@ChatPageFragment, "notification sent", Toast.LENGTH_SHORT).show()
+
+                    }
+                }
+            }
+        }
+    }
+
+
+    override fun onStop() {
+        super.onStop()
+        socket!!.emit("signout",currentUser)
+        Toast.makeText(this, "signout called", Toast.LENGTH_SHORT).show()
+
+        if (FirebaseAuth.getInstance().currentUser != null) {
+            val jsonObject = JsonObject()
+            val userid: String =
+                getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 59)
+                    .toString()
+            jsonObject.addProperty("apikey", "bWFnZ2llOnN1bW1lcnM")
+            jsonObject.addProperty("status", "offline")
+            jsonObject.addProperty("googleId",userid)
+
+            UpdateStatusApi.getInstance().myApi.updateStatus(jsonObject)
+                .enqueue(object : Callback<UpdateStatus?> {
+                    override fun onResponse(
+                        call: Call<UpdateStatus?>,
+                        response: Response<UpdateStatus?>
+                    ) {
+                        Toast.makeText(
+                            this@ChatPageFragment,
+                            if (response.body() != null) response.body()!!.message else null,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+
+                    override fun onFailure(call: Call<UpdateStatus?>, t: Throwable) {}
+                })
+        }
+
+    }
+    private fun subscribeToUpdateIsSeen(list : List<AllmessageItems>) {
+        Log.d("mssg",list.toString())
+        val position = 0
+        val lastMessage = list[0]
+        if(lastMessage.sender.equals(currentUser)){
+            //to update nhi krna hai
+
+        }else{
+            //to update krna hai
+            chatviewmodel.updateIsSeen(API_KEY,lastMessage.Id)
+            lifecycleScope.launchWhenStarted {
+                chatviewmodel.updateseen.collect {
+                    when(it){
+                        is sendMessageState.Loading->{
+                            Toast.makeText(this@ChatPageFragment, "updating loading", Toast.LENGTH_SHORT).show()
+                        }
+                        is sendMessageState.Failure->{
+                            Log.d("nnn",it.mssg.toString())
+                        }
+                        is sendMessageState.Success->{
+                            Toast.makeText(this@ChatPageFragment, it.responce.body()!!.message, Toast.LENGTH_SHORT).show()
+                            if(lastMessage.sender.equals(getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 0).toString())){
+                                getMessagesByPaging()
+                            }
+
+                        }
+                    }
+                }
+            }
+
+        }
+
+    }
+
+
+
+    override fun onStart() {
+        super.onStart()
+
+
+
+        Handler(Looper.myLooper()).postDelayed({
+            if (FirebaseAuth.getInstance().currentUser != null) {
+                val jsonObject = JsonObject()
+                val userid: String =
+                    getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 0)
+                        .toString()
+                jsonObject.addProperty("apikey", "bWFnZ2llOnN1bW1lcnM")
+                jsonObject.addProperty("status", "online")
+                jsonObject.addProperty("googleId", userid)
+
+                UpdateStatusApi.getInstance().myApi.updateStatus(jsonObject)
+                    .enqueue(object : Callback<UpdateStatus?> {
+                        override fun onResponse(
+                            call: Call<UpdateStatus?>,
+                            response: Response<UpdateStatus?>
+                        ) {
+                            Toast.makeText(
+                                this@ChatPageFragment,
+                                if (response.body() != null) response.body()!!.message else null,
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+
+                        override fun onFailure(call: Call<UpdateStatus?>, t: Throwable) {}
+                    })
+            }
+        },1000L)
+
+
+
+    }
+
+    override fun onMessageClick(position: Int) {
+
+        val intent = Intent(this,OpenVideoActivity::class.java)
+        val uri = adapter.snapshot().items[position].video
+        if(adapter.snapshot().items[position].messageType=="video"){
+            Log.d("fff",uri)
+            intent.putExtra("uri",uri)
+            startActivity(intent)
+        }
+
+
+    }
+
+    private fun subscribeToUpdateIsSeenonStart(list : List<AllmessageItem>) {
+        Log.d("mssg",list.toString())
+        val position = 0
+        val lastMessage = list[0]
+        if(lastMessage.sender.equals(currentUser)){
+            //to update nhi krna hai
+
+        }else{
+            //to update krna hai
+            chatviewmodel.updateIsSeen(API_KEY,lastMessage.Id)
+            lifecycleScope.launchWhenStarted {
+                chatviewmodel.updateseen.collect {
+                    when(it){
+                        is sendMessageState.Loading->{
+                            Toast.makeText(this@ChatPageFragment, "updating loading", Toast.LENGTH_SHORT).show()
+                        }
+                        is sendMessageState.Failure->{
+                            Log.d("nnn",it.mssg.toString())
+                        }
+                        is sendMessageState.Success->{
+                            Toast.makeText(this@ChatPageFragment, it.responce.body()!!.message, Toast.LENGTH_SHORT).show()
+                            if(lastMessage.sender.equals(getSharedPreferences("userpref", Context.MODE_PRIVATE).getInt("user_id", 0).toString())){
+                                getMessagesByPaging()
+                            }
+
+                        }
+                    }
+                }
+            }
+
+        }
+
+    }
+
+
+
+}
